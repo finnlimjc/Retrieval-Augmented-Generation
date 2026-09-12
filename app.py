@@ -21,8 +21,8 @@ CHROMA_PATH = Path(".chroma")
 MARKDOWN_KNOWLEDGE_BASE_PATH = Path(__file__).with_name(".knowledge_base_md")
 KNOWLEDGE_BASE_PATH = Path(__file__).with_name("extracted_elements.pkl")
 COLLECTION_NAME = "financial_documents"
-CHUNK_SIZE = 800
-CHUNK_OVERLAP = 120
+CHUNK_SIZE = 256
+CHUNK_OVERLAP = 25
 SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
