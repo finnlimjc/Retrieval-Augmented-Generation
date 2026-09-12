@@ -26,3 +26,4 @@ env/
 # Local OS and editor files
 .DS_Store
 .vscode/settings.json
+*.env
