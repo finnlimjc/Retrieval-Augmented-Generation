@@ -12,6 +12,7 @@
 *.pdf
 *.pkl
 *.pickle
+extracted_elements.pkl
 
 # Python caches and local environments
 __pycache__/
