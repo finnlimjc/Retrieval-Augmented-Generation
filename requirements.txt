@@ -1,15 +1,19 @@
 # Vector store and embeddings
 langchain-core==1.6.2
 langchain-google-genai==4.4.0
-langchain-text-splitters==1.1.2
 
 # Document extraction
 pdfplumber==0.11.5
-pypdf==3.17.4
+pypdf==6.18.1
 python-docx==1.2.0
 python-pptx==1.0.2
 openpyxl==3.1.5
 
 # Environment and notebook
-python-dotenv==1.0.0
+python-dotenv==1.2.3
 ipykernel==6.29.5
+
+# Dashboard
+streamlit==1.63.0
+chromadb==1.5.9
+google-genai==2.23.0
