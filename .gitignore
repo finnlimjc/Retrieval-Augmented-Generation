@@ -1,1 +1,26 @@
 /data
+.chroma/
+.streamlit/secrets.toml
+
+# Local credentials and environment files
+.env
+.env.*
+!.env.example
+
+# Uploaded source documents and serialized processor output
+*.pdf
+*.pkl
+*.pickle
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+
+# Local OS and editor files
+.DS_Store
+.vscode/settings.json
