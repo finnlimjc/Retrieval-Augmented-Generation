@@ -1,5 +1,6 @@
 /data
 .chroma/
+.knowledge_base_md/
 .streamlit/secrets.toml
 
 # Local credentials and environment files
