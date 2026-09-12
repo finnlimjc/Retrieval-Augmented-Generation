@@ -28,12 +28,14 @@ SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 @st.cache_resource
 def get_collection() -> Any:
+	"""Return the persistent Chroma collection used as the document index."""
 	client = chromadb.PersistentClient(path=str(CHROMA_PATH))
 	return client.get_or_create_collection(name=COLLECTION_NAME)
 
 
 @st.cache_resource
 def get_gemini_client() -> genai.Client:
+	"""Create the cached Gemini client from Streamlit's secret configuration."""
 	api_key = st.secrets.get("GEMINI_API_KEY")
 	if not api_key:
 		raise RuntimeError(
@@ -73,6 +75,7 @@ def primitive_metadata(element: Any, source_name: str) -> dict[str, str | int | 
 
 
 def load_elements(file_bytes: bytes, file_name: str) -> list[Any]:
+	"""Convert a supported upload into a list of text-bearing elements."""
 	if file_name.lower().endswith(".pdf"):
 		reader = PdfReader(io.BytesIO(file_bytes))
 		return [
@@ -94,6 +97,7 @@ def chunk_text(
 	chunk_size: int = CHUNK_SIZE,
 	chunk_overlap: int = CHUNK_OVERLAP,
 ) -> list[str]:
+	"""Split text into overlapping word-based chunks for embedding."""
 	if chunk_size <= 0 or chunk_overlap < 0 or chunk_overlap >= chunk_size:
 		raise ValueError("Chunk overlap must be non-negative and smaller than chunk size.")
 
@@ -110,6 +114,7 @@ def chunk_text(
 
 
 def index_upload(uploaded_file: Any, chunk_size: int, chunk_overlap: int) -> int:
+	"""Extract, chunk, and upsert one uploaded document into Chroma."""
 	file_bytes = uploaded_file.getvalue()
 	file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
 	collection = get_collection()
@@ -120,11 +125,14 @@ def index_upload(uploaded_file: Any, chunk_size: int, chunk_overlap: int) -> int
 	global_chunk_index = 0
 
 	for element_index, element in enumerate(elements):
-		text = element_text(element)
+		# Convert the element and build its stable metadata only once per element.
+		element_values = as_mapping(element)
+		text = element_text(element_values)
+		base_metadata = primitive_metadata(element_values, uploaded_file.name)
 		for chunk_index, chunk in enumerate(chunk_text(text, chunk_size, chunk_overlap)):
 			ids.append(f"{file_hash}-{element_index}-{chunk_index}")
 			documents.append(chunk)
-			metadata = primitive_metadata(element, uploaded_file.name)
+			metadata = base_metadata.copy()
 			metadata.update(
 				{
 					"document_id": file_hash,
@@ -151,6 +159,8 @@ def retrieve_document_context(query: str, document_count: int = 4) -> list[dict[
 		n_results=document_count,
 		include=["metadatas"],
 	)
+	# Search returns representative chunks; the answer uses all chunks from each
+	# matched document so the model has the complete source context.
 	matched_metadata = matches.get("metadatas", [[]])[0]
 	document_ids = list(dict.fromkeys(
 		metadata["document_id"]
@@ -185,10 +195,12 @@ def format_footnote_markers(answer: str) -> str:
 
 
 def generate_answer(query: str, model: str, document_count: int) -> str:
+	"""Retrieve source context and ask Gemini for a cited, grounded answer."""
 	documents = retrieve_document_context(query, document_count)
 	if not documents:
 		return "No indexed documents are available. Upload and process a document first."
 
+	# Keep the source list and the prompt's document numbering in sync.
 	citation_lines = []
 	context_sections = []
 	for citation_number, document in enumerate(documents, start=1):
