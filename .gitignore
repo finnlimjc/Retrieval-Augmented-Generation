@@ -1,5 +1,6 @@
 /data
 .chroma/
+.knowledge_base_md/
 .streamlit/secrets.toml
 
 # Local credentials and environment files
@@ -11,6 +12,7 @@
 *.pdf
 *.pkl
 *.pickle
+extracted_elements.pkl
 
 # Python caches and local environments
 __pycache__/

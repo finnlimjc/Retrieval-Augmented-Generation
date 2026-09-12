@@ -1,15 +1,13 @@
 import hashlib
-import io
 import pickle
 import re
-from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any
 
 import chromadb
 import streamlit as st
 from google import genai
-from pypdf import PdfReader
+from utilities import as_mapping, knowledge_base_to_markdown
 
 
 st.set_page_config(
@@ -20,6 +18,8 @@ st.set_page_config(
 
 
 CHROMA_PATH = Path(".chroma")
+MARKDOWN_KNOWLEDGE_BASE_PATH = Path(__file__).with_name(".knowledge_base_md")
+KNOWLEDGE_BASE_PATH = Path(__file__).with_name("extracted_elements.pkl")
 COLLECTION_NAME = "financial_documents"
 CHUNK_SIZE = 800
 CHUNK_OVERLAP = 120
@@ -44,16 +44,6 @@ def get_gemini_client() -> genai.Client:
 	return genai.Client(api_key=api_key)
 
 
-def as_mapping(element: Any) -> dict[str, Any]:
-	if is_dataclass(element):
-		return asdict(element)
-	if isinstance(element, dict):
-		return element
-	if hasattr(element, "__dict__"):
-		return vars(element)
-	return {"text": str(element)}
-
-
 def element_text(element: Any) -> str:
 	values = as_mapping(element)
 	for field_name in ("text", "content", "page_content", "raw_text"):
@@ -74,22 +64,29 @@ def primitive_metadata(element: Any, source_name: str) -> dict[str, str | int | 
 	return metadata
 
 
-def load_elements(file_bytes: bytes, file_name: str) -> list[Any]:
-	"""Convert a supported upload into a list of text-bearing elements."""
-	if file_name.lower().endswith(".pdf"):
-		reader = PdfReader(io.BytesIO(file_bytes))
-		return [
-			{"text": page.extract_text() or "", "page_number": page_number + 1}
-			for page_number, page in enumerate(reader.pages)
-		]
+class SerializedElement:
+	def __new__(cls, *args: Any, **kwargs: Any) -> "SerializedElement":
+		return object.__new__(cls)
 
-	loaded = pickle.loads(file_bytes)
-	if isinstance(loaded, (list, tuple)):
-		return list(loaded)
-	if isinstance(loaded, dict) and "elements" in loaded:
-		elements = loaded["elements"]
-		return list(elements) if isinstance(elements, (list, tuple)) else [elements]
-	return [loaded]
+
+class KnowledgeBaseUnpickler(pickle.Unpickler):
+	def find_class(self, module: str, name: str) -> type[SerializedElement]:
+		return SerializedElement
+
+
+@st.cache_resource
+def load_knowledge_base(path: str, modified_time: int) -> dict[str, list[Any]]:
+	"""Convert the pickle to Markdown, then load Markdown for chunking."""
+	with Path(path).open("rb") as file:
+		loaded = KnowledgeBaseUnpickler(file).load()
+	if not isinstance(loaded, dict):
+		raise ValueError("The knowledge base must contain a source-file mapping.")
+
+	markdown_paths = knowledge_base_to_markdown(loaded, MARKDOWN_KNOWLEDGE_BASE_PATH)
+	return {
+		source_name: [{"text": markdown_path.read_text(encoding="utf-8")}]
+		for source_name, markdown_path in markdown_paths.items()
+	}
 
 
 def chunk_text(
@@ -113,35 +110,49 @@ def chunk_text(
 	return chunks
 
 
-def index_upload(uploaded_file: Any, chunk_size: int, chunk_overlap: int) -> int:
-	"""Extract, chunk, and upsert one uploaded document into Chroma."""
-	file_bytes = uploaded_file.getvalue()
+@st.cache_resource
+def index_knowledge_base(
+	path: str,
+	modified_time: int,
+	chunk_size: int,
+	chunk_overlap: int,
+) -> int:
+	"""Chunk and upsert all preprocessed knowledge-base elements into Chroma."""
+	file_bytes = Path(path).read_bytes()
 	file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
 	collection = get_collection()
-	elements = load_elements(file_bytes, uploaded_file.name)
+	knowledge_base = load_knowledge_base(path, modified_time)
+	collection.delete(
+		where={
+			"document_id": {
+				"$in": [f"{file_hash}-{source_name}" for source_name in knowledge_base]
+			}
+		}
+	)
 	ids: list[str] = []
 	documents: list[str] = []
 	metadatas: list[dict[str, str | int | float | bool]] = []
 	global_chunk_index = 0
 
-	for element_index, element in enumerate(elements):
-		# Convert the element and build its stable metadata only once per element.
-		element_values = as_mapping(element)
-		text = element_text(element_values)
-		base_metadata = primitive_metadata(element_values, uploaded_file.name)
-		for chunk_index, chunk in enumerate(chunk_text(text, chunk_size, chunk_overlap)):
-			ids.append(f"{file_hash}-{element_index}-{chunk_index}")
-			documents.append(chunk)
-			metadata = base_metadata.copy()
-			metadata.update(
-				{
-					"document_id": file_hash,
-					"element_index": element_index,
-					"chunk_index": global_chunk_index,
-				}
-			)
-			metadatas.append(metadata)
-			global_chunk_index += 1
+	for source_name, elements in knowledge_base.items():
+		for element_index, element in enumerate(elements):
+			# Convert the element and build its stable metadata only once per element.
+			element_values = as_mapping(element)
+			text = element_text(element_values)
+			base_metadata = primitive_metadata(element_values, source_name)
+			for chunk_index, chunk in enumerate(chunk_text(text, chunk_size, chunk_overlap)):
+				ids.append(f"{file_hash}-{element_index}-{chunk_index}-{source_name}")
+				documents.append(chunk)
+				metadata = base_metadata.copy()
+				metadata.update(
+					{
+						"document_id": f"{file_hash}-{source_name}",
+						"element_index": element_index,
+						"chunk_index": global_chunk_index,
+					}
+				)
+				metadatas.append(metadata)
+				global_chunk_index += 1
 
 	if documents:
 		collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
@@ -237,6 +248,7 @@ USER QUESTION:
 def main() -> None:
 	st.title("RAG Chatbot")
 	st.caption("Ask questions about your documents and get grounded answers.")
+	knowledge_base_available = False
 
 	with st.sidebar:
 		st.header("Knowledge Base")
@@ -257,22 +269,33 @@ def main() -> None:
 			step=10,
 			help="Words repeated between neighboring chunks to preserve context.",
 		)
-		uploaded_files = st.file_uploader(
-			"Upload documents",
-			type=["pkl", "pdf"],
-			accept_multiple_files=True,
-		)
-		if uploaded_files and st.button("Process documents", type="primary"):
-			with st.spinner("Chunking and embedding documents..."):
-				try:
-					chunk_count = sum(
-						index_upload(file, chunk_size, chunk_overlap)
-						for file in uploaded_files
-					)
-				except Exception as error:
-					st.error(f"Could not process the uploaded documents: {error}")
-				else:
-					st.success(f"Indexed {chunk_count} chunks in Chroma.")
+		if not KNOWLEDGE_BASE_PATH.exists():
+			st.error("Knowledge base not available")
+		else:
+			modified_time = KNOWLEDGE_BASE_PATH.stat().st_mtime_ns
+			initialization_settings = (
+				str(KNOWLEDGE_BASE_PATH),
+				modified_time,
+				chunk_size,
+				chunk_overlap,
+			)
+			initialize_chunking = st.button("Initialize chunking", type="primary")
+			if initialize_chunking:
+				with st.spinner("Chunking and embedding documents..."):
+					try:
+						chunk_count = index_knowledge_base(*initialization_settings)
+					except Exception as error:
+						st.session_state.pop("knowledge_base_settings", None)
+						st.error("Knowledge base not available")
+						st.caption(f"Could not load the preprocessed file: {error}")
+					else:
+						st.session_state["knowledge_base_settings"] = initialization_settings
+						st.success(f"Knowledge base ready ({chunk_count} chunks indexed).")
+			knowledge_base_available = (
+				st.session_state.get("knowledge_base_settings") == initialization_settings
+			)
+			if not knowledge_base_available and not initialize_chunking:
+				st.info("Adjust the chunk settings, then click Initialize chunking.")
 		st.divider()
 		st.subheader("Settings")
 		model = st.selectbox("Model", ["gemini-3.5-flash"])
@@ -280,14 +303,14 @@ def main() -> None:
 
 	st.subheader("Chat")
 
-	if not st.session_state.get("messages"):
-		st.info("Upload a document, then ask a question to get started.")
+	if knowledge_base_available and not st.session_state.get("messages"):
+		st.info("Ask a question about the knowledge base to get started.")
 
 	for message in st.session_state.get("messages", []):
 		with st.chat_message(message["role"]):
 			st.markdown(message["content"])
 
-	if prompt := st.chat_input("Ask a question about your documents..."):
+	if knowledge_base_available and (prompt := st.chat_input("Ask a question about your documents...")):
 		st.session_state.setdefault("messages", []).append(
 			{"role": "user", "content": prompt}
 		)
