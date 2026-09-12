@@ -4,7 +4,7 @@ This project is a Streamlit-based retrieval-augmented generation (RAG) chatbot.
 It reads a locally generated `extracted_elements.pkl` knowledge base, splits its
 preprocessed elements into overlapping text chunks, stores those chunks in a
 persistent Chroma collection, and answers questions about the source documents.
-Answers are generated with Google's Gemini API and include source markers for
+Answers are generated with Google's Gemini API and include numbered Markdown citations for
 information drawn from the documents.
 
 The preprocessing step that creates `extracted_elements.pkl` is separate from
@@ -54,10 +54,9 @@ Streamlit will display a local URL, usually `http://localhost:8501`.
 3. In the **Knowledge Base** sidebar, adjust the chunk size and chunk overlap.
 4. Click **Initialize chunking** to index the preprocessed elements in Chroma.
 	Click it again after changing the chunk settings.
-5. In **Settings**, choose the Gemini model and the number of retrieved sources
-	to use for each answer.
-6. Enter a question in the chat box. The chatbot searches the indexed knowledge
-	base and responds with grounded answers and source footnotes.
+5. In **Settings**, choose the Gemini model.
+6. Enter a question in the chat box. The chatbot searches all indexed source
+	documents and responds with grounded answers and a matching numbered source list.
 
 The Chroma index is persisted locally, so it remains available across app
 restarts unless the `.chroma` directory is removed.

@@ -23,7 +23,6 @@ KNOWLEDGE_BASE_PATH = Path(__file__).with_name("extracted_elements.pkl")
 COLLECTION_NAME = "financial_documents"
 CHUNK_SIZE = 256
 CHUNK_OVERLAP = 25
-SUPERSCRIPT_DIGITS = str.maketrans("0123456789", "⁰¹²³⁴⁵⁶⁷⁸⁹")
 
 
 @st.cache_resource
@@ -159,12 +158,18 @@ def index_knowledge_base(
 	return len(documents)
 
 
-def retrieve_document_context(query: str, document_count: int = 4) -> list[dict[str, str]]:
+def retrieve_document_context(
+	query: str,
+	document_count: int | None = None,
+) -> list[dict[str, str]]:
 	"""Find relevant files, then return every chunk from each matched file."""
 	collection = get_collection()
 	if collection.count() == 0:
 		return []
-	document_count = min(document_count, collection.count())
+	if document_count is None:
+		document_count = collection.count()
+	else:
+		document_count = min(document_count, collection.count())
 	matches = collection.query(
 		query_texts=[query],
 		n_results=document_count,
@@ -198,25 +203,46 @@ def retrieve_document_context(query: str, document_count: int = 4) -> list[dict[
 
 
 def format_footnote_markers(answer: str) -> str:
+	"""Convert legacy HTML citation markers to readable Markdown citations."""
 	return re.sub(
-		r"<sup>(\d+)</sup>",
-		lambda match: match.group(1).translate(SUPERSCRIPT_DIGITS),
+		r"<sup>(\d+(?:\s*,\s*\d+)*)</sup>",
+		lambda match: "[" + re.sub(r"\s*,\s*", ", ", match.group(1)) + "]",
 		answer,
 	)
 
 
-def generate_answer(query: str, model: str, document_count: int) -> str:
+def append_canonical_sources(answer: str, citation_sources: dict[int, str]) -> str:
+	"""Append only the retrieved sources referenced by inline citations."""
+	answer_without_sources = re.split(
+		r"(?im)^\s{0,3}(?:#{1,6}\s*)?Sources\s*:?\s*$",
+		answer,
+		maxsplit=1,
+	)[0].rstrip()
+	citation_numbers = {
+		int(number)
+		for citation in re.findall(r"\[(\d+(?:\s*,\s*\d+)*)\]", answer_without_sources)
+		for number in citation.split(",")
+	}
+	referenced_sources = [
+		f"{citation_number}. {citation_sources[citation_number]}"
+		for citation_number in sorted(citation_numbers)
+		if citation_number in citation_sources
+	]
+	return f"{answer_without_sources}\n\nSources\n" + "\n".join(referenced_sources)
+
+
+def generate_answer(query: str, model: str) -> str:
 	"""Retrieve source context and ask Gemini for a cited, grounded answer."""
-	documents = retrieve_document_context(query, document_count)
+	documents = retrieve_document_context(query)
 	if not documents:
 		return "No indexed documents are available. Upload and process a document first."
 
 	# Keep the source list and the prompt's document numbering in sync.
-	citation_lines = []
+	citation_sources = {}
 	context_sections = []
 	for citation_number, document in enumerate(documents, start=1):
 		source = document["source"]
-		citation_lines.append(f"{citation_number}. {source}")
+		citation_sources[citation_number] = source
 		context_sections.append(
 			f"DOCUMENT {citation_number} ({source}, footnote {citation_number}):\n"
 			f"{document['content']}"
@@ -224,13 +250,13 @@ def generate_answer(query: str, model: str, document_count: int) -> str:
 	context = "\n\n".join(context_sections)
 	prompt = f"""You are a junior financial analyst compiling findings from the provided documents for your boss, a senior analyst.
 
-Provide the relevant information requested by the senior analyst clearly and accurately. Use only the document context below. If the answer is not present in the documents, say that you cannot find it in the uploaded documents. Do not invent financial figures or facts.
+	Provide the relevant information requested by the senior analyst clearly and accurately. Use only the document context below. If the answer is not present in the documents, say that you cannot find it in the uploaded documents. Do not invent financial figures or facts. Treat each document as an independent source: never combine a company's figures with figures from another company. Copy financial numbers, units, decimal points, commas, percent signs, and spaces exactly as written in the cited source. Do not concatenate adjacent words or values. When reporting a figure, verify that every number in the sentence comes from the same cited document.
 
-	Cite every factual statement drawn from a document using a Chicago-style superscript footnote marker, such as `<sup>1</sup>`, immediately after the relevant sentence or figure. Use multiple superscript markers when a statement relies on multiple documents. End your answer with a "Sources" section containing numbered footnotes in this format: `1. annual_report.pdf`.
+	Cite every factual statement drawn from a document using a numbered Markdown citation, such as `[1]`, immediately after the relevant sentence or figure. If a statement relies on multiple documents, use one grouped citation such as `[1, 2]`. Do not write a Sources section; the application will append the canonical numbered source list.
 
 If the documents contain confidential, private, or otherwise sensitive information relevant to the answer, clearly flag it as confidential or sensitive and remind the senior analyst to handle it carefully and avoid unauthorized disclosure.
 
-DOCUMENT CONTEXT:
+	DOCUMENT CONTEXT (each document is independent; do not merge facts across documents):
 {context}
 
 USER QUESTION:
@@ -240,9 +266,7 @@ USER QUESTION:
 		contents=prompt,
 	)
 	answer = response.text or "Gemini returned an empty response."
-	if "Sources" not in answer:
-		answer = f"{answer}\n\nSources\n" + "\n".join(citation_lines)
-	return format_footnote_markers(answer)
+	return append_canonical_sources(format_footnote_markers(answer), citation_sources)
 
 
 def main() -> None:
@@ -299,7 +323,6 @@ def main() -> None:
 		st.divider()
 		st.subheader("Settings")
 		model = st.selectbox("Model", ["gemini-3.5-flash"])
-		document_count = st.slider("Retrieved sources", min_value=1, max_value=10, value=4)
 
 	st.subheader("Chat")
 
@@ -320,7 +343,7 @@ def main() -> None:
 		with st.chat_message("assistant"):
 			with st.spinner("Reviewing your documents..."):
 				try:
-					answer = generate_answer(prompt, model, document_count)
+					answer = generate_answer(prompt, model)
 				except Exception as error:
 					answer = f"I could not generate an answer: {error}"
 				st.markdown(answer)
