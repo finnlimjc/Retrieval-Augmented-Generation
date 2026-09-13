@@ -61,3 +61,19 @@ Streamlit will display a local URL, usually `http://localhost:8501`.
 The Chroma index is persisted locally, so it remains available across app
 restarts unless the `.chroma` directory is removed.
 
+## Data
+
+The source corpus is provided by the course (DS602) and is **not included in this
+repository**. It is not ours to redistribute.
+
+Shape of the corpus, for reference:
+- ~54 files across 6 formats: Markdown, DOCX, PPTX, XLSX, PDF, and EML
+- Includes: daily market digests, single-stock research notes, earnings call
+  summaries, sector/macro research, central bank minutes, internal decks,
+  desk memos, financial models, and forwarded emails with attachments
+- Deliberately includes edge cases: scanned/image-only PDFs, versioned
+  duplicate notes, a hidden spreadsheet tab, and prompt injections embedded
+  in document text — see "Known limitations" below for how this pipeline
+  handles them
+
+
