@@ -11,6 +11,8 @@ The preprocessing step that creates `extracted_elements.pkl` is separate from
 this application and runs on the local device. The generated file is ignored by
 Git and must not be committed or uploaded to GitHub.
 
+<img width="1847" height="842" alt="architecture_diagram" src="https://github.com/user-attachments/assets/7b3da3d8-0dc1-435a-8e94-558f4a51054e" />
+
 ## Installation
 
 Install Python 3.10 or newer, then open a terminal in the project directory.
