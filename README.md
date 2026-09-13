@@ -76,4 +76,12 @@ Shape of the corpus, for reference:
   in document text — see "Known limitations" below for how this pipeline
   handles them
 
+## Key decisions
 
+Summary:
+
+| Decision | Chosen | Rejected | Why |
+|---|---|---|---|
+| Chunking | Fixed word-count split (256 words) | Structure-aware chunking | Sufficient for POC purpose. To explore larger model once initial acceptance is obtained from stakeholders. |
+| Overlap | 10% | >10% | Too much overlap can reduce retrieval quality with more duplicated content stored, taking into consideration the embedding model’s max length of 256. |
+| Vector DB | Chroma, persisted locally | FAISS | Simpler out-of-box persistence for a one-week POC. |
