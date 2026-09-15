@@ -1,4 +1,5 @@
 import re
+import json
 from dataclasses import asdict, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
@@ -84,12 +85,15 @@ def knowledge_base_to_markdown(
         markdown_path = output_directory / f"{safe_name}.md"
         sections = [f"# {source_name}"]
         for element_index, element in enumerate(elements, start=1):
-            metadata = [
-                f"**{key}:** {value}"
-                for key, value in element.items()
-                if key not in TEXT_FIELDS
-                and isinstance(value, (str, int, float, bool))
-            ]
+            metadata = []
+            for key, value in element.items():
+                if key in TEXT_FIELDS or value is None:
+                    continue
+                if isinstance(value, (dict, list, tuple)):
+                    formatted_value = json.dumps(value, ensure_ascii=True, sort_keys=True)
+                else:
+                    formatted_value = str(value)
+                metadata.append(f"**{key}:** {formatted_value}")
             section = [f"## Element {element_index}"]
             if metadata:
                 section.extend(metadata)
