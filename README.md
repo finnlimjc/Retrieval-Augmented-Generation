@@ -142,6 +142,32 @@ Per-format parsing:
 | MD | Read the whole file as one narrative element | Structure-aware split on headings | Simplest option for a POC; loses heading hierarchy at the element level (left to the later chunking stage) |
 | Images (PDF and PPTX) | Cache vision-model output (OCR transcription or chart-data extraction) on disk, keyed by a hash of the image bytes + prompt | Call the vision model on every run | Avoids repeat API cost/latency across notebook re-runs, but a bad transcription is cached and reused just as readily as a good one — there is no validation step |
 
+## How the Chatbot Works
+
+The chatbot is a Streamlit-based RAG application. It reads the locally generated
+`extracted_elements.pkl` knowledge base, removes sources containing detected prompt
+injection patterns, and skips sources with no searchable text, including image- or
+binary-only elements. Remaining source elements are normalized into Markdown so that
+different document formats share a consistent representation before indexing.
+
+When the user clicks **Initialize chunking**, the application splits the Markdown
+content into overlapping word-based chunks and stores them in a persistent Chroma
+collection under `.chroma`. Chunk size and overlap are configurable in the sidebar.
+The chatbot uses semantic top-k retrieval, with a default of 5 and a configurable
+range from 1 to 20. For each matched source, it reconstructs the source context from
+its indexed chunks before sending that context to Gemini.
+
+Current features include:
+
+- Grounded answers generated from retrieved document context.
+- Instructions to Gemini to avoid inventing facts and to say when information is not
+  present in the uploaded documents.
+- Controlled `SOURCE_n` citation markers converted into readable source references
+  and a **Retrieved Sources** list.
+- Session-based chat history within the Streamlit application.
+- Warnings for excluded prompt-injected, empty, image-only, or binary-only sources.
+- Local persistence of the Chroma index across application restarts.
+
 ## Known limitations
 
 - **Vector-based images are not handled.** Only raster images/pictures
@@ -169,6 +195,7 @@ Per-format parsing:
 
 ## Future work
 
+- Merge document pre-processing and RAG chatbot into one flow — pre-processing and chatbot were built separated for exploration.
 - Detect and transcribe vector-based charts/images — PDF content-stream
   drawings, PowerPoint chart objects, and PowerPoint autoshapes — instead of
   silently skipping anything that isn't a raster picture.

@@ -23,6 +23,13 @@ KNOWLEDGE_BASE_PATH = Path(__file__).with_name("extracted_elements.pkl")
 COLLECTION_NAME = "financial_documents"
 CHUNK_SIZE = 256
 CHUNK_OVERLAP = 25
+RETRIEVAL_TOP_K = 5
+PROMPT_INJECTION_PATTERNS = (
+	("instruction override", re.compile(r"\b(ignore|disregard|forget|override)\b.{0,80}\b(previous|above|prior|system|developer|user)\b.{0,40}\b(instruction|prompt|message)s?\b", re.IGNORECASE)),
+	("role impersonation", re.compile(r"\b(system message|developer message|assistant message|you are chatgpt|you are an ai)\b", re.IGNORECASE)),
+	("prompt disclosure request", re.compile(r"\b(reveal|disclose|show|print|repeat)\b.{0,60}\b(system prompt|hidden prompt|instructions)\b", re.IGNORECASE)),
+)
+IMAGE_ELEMENT_TYPES = {"figure", "scan_page", "scan_slide", "image", "binary"}
 
 
 @st.cache_resource
@@ -53,6 +60,62 @@ def element_text(element: Any) -> str:
 	return " ".join(str(value) for value in values.values() if isinstance(value, str)).strip()
 
 
+def source_warnings(source_name: str, elements: Any) -> list[str]:
+	"""Return warnings for sources that should not be indexed as-is."""
+	if not isinstance(elements, (list, tuple)):
+		elements = [elements]
+	texts: list[str] = []
+	warnings: list[str] = []
+	for element in elements:
+		values = as_mapping(element)
+		text = next(
+			(
+				str(values[field_name]).strip()
+				for field_name in ("text", "content", "page_content", "raw_text")
+				if isinstance(values.get(field_name), str) and values[field_name].strip()
+			),
+			"",
+		)
+		if text:
+			texts.append(text)
+		if values.get("element_type") in IMAGE_ELEMENT_TYPES:
+			warnings.append(
+				f"Skipped image or binary element in {source_name}; only text elements are indexed."
+			)
+	combined_text = "\n".join(texts)
+
+	for warning_name, pattern in PROMPT_INJECTION_PATTERNS:
+		if pattern.search(combined_text):
+			warnings.append(
+				f"Skipped {source_name}: possible prompt injection detected ({warning_name})."
+			)
+			return list(dict.fromkeys(warnings))
+
+	if not combined_text:
+		warnings.append(
+			f"Skipped {source_name}: no searchable text was found; image or binary content is not indexed."
+		)
+	return list(dict.fromkeys(warnings))
+
+
+def source_should_be_excluded(elements: Any) -> bool:
+	"""Exclude a whole source for injection risk or when it has no text."""
+	if not isinstance(elements, (list, tuple)):
+		elements = [elements]
+	texts = []
+	for element in elements:
+		values = as_mapping(element)
+		for field_name in ("text", "content", "page_content", "raw_text"):
+			value = values.get(field_name)
+			if isinstance(value, str) and value.strip():
+				texts.append(value.strip())
+	combined_text = "\n".join(texts)
+	return not combined_text or any(
+		pattern.search(combined_text)
+		for _, pattern in PROMPT_INJECTION_PATTERNS
+	)
+
+
 def primitive_metadata(element: Any, source_name: str) -> dict[str, str | int | float | bool]:
 	metadata: dict[str, str | int | float | bool] = {"source": source_name}
 	for key, value in as_mapping(element).items():
@@ -74,18 +137,35 @@ class KnowledgeBaseUnpickler(pickle.Unpickler):
 
 
 @st.cache_resource
-def load_knowledge_base(path: str, modified_time: int) -> dict[str, list[Any]]:
+def load_knowledge_base(
+	path: str,
+	modified_time: int,
+) -> tuple[dict[str, list[Any]], list[str]]:
 	"""Convert the pickle to Markdown, then load Markdown for chunking."""
 	with Path(path).open("rb") as file:
 		loaded = KnowledgeBaseUnpickler(file).load()
 	if not isinstance(loaded, dict):
 		raise ValueError("The knowledge base must contain a source-file mapping.")
 
-	markdown_paths = knowledge_base_to_markdown(loaded, MARKDOWN_KNOWLEDGE_BASE_PATH)
-	return {
+	filtered_knowledge_base: dict[str, Any] = {}
+	warnings: list[str] = []
+	for source_name, elements in loaded.items():
+		source_name = str(source_name)
+		source_issues = source_warnings(source_name, elements)
+		if source_should_be_excluded(elements):
+			warnings.extend(source_issues)
+			continue
+		warnings.extend(source_issues)
+		filtered_knowledge_base[source_name] = elements
+
+	markdown_paths = knowledge_base_to_markdown(
+		filtered_knowledge_base,
+		MARKDOWN_KNOWLEDGE_BASE_PATH,
+	)
+	return ({
 		source_name: [{"text": markdown_path.read_text(encoding="utf-8")}]
 		for source_name, markdown_path in markdown_paths.items()
-	}
+	}, warnings)
 
 
 def chunk_text(
@@ -115,12 +195,12 @@ def index_knowledge_base(
 	modified_time: int,
 	chunk_size: int,
 	chunk_overlap: int,
-) -> int:
+) -> tuple[int, list[str]]:
 	"""Chunk and upsert all preprocessed knowledge-base elements into Chroma."""
 	file_bytes = Path(path).read_bytes()
 	file_hash = hashlib.sha256(file_bytes).hexdigest()[:16]
 	collection = get_collection()
-	knowledge_base = load_knowledge_base(path, modified_time)
+	knowledge_base, warnings = load_knowledge_base(path, modified_time)
 	collection.delete(
 		where={
 			"document_id": {
@@ -155,7 +235,7 @@ def index_knowledge_base(
 
 	if documents:
 		collection.upsert(ids=ids, documents=documents, metadatas=metadatas)
-	return len(documents)
+	return len(documents), warnings
 
 
 def retrieve_document_context(
@@ -202,38 +282,64 @@ def retrieve_document_context(
 	return full_documents
 
 
-def format_footnote_markers(answer: str) -> str:
-	"""Convert legacy HTML citation markers to readable Markdown citations."""
-	return re.sub(
-		r"<sup>(\d+(?:\s*,\s*\d+)*)</sup>",
-		lambda match: "[" + re.sub(r"\s*,\s*", ", ", match.group(1)) + "]",
-		answer,
-	)
-
-
-def append_canonical_sources(answer: str, citation_sources: dict[int, str]) -> str:
-	"""Append only the retrieved sources referenced by inline citations."""
+def render_source_citations(answer: str, citation_sources: dict[int, str]) -> str:
+	"""Render controlled source markers without relying on Markdown citations."""
 	answer_without_sources = re.split(
-		r"(?im)^\s{0,3}(?:#{1,6}\s*)?Sources\s*:?\s*$",
+		r"(?im)^\s{0,3}(?:#{1,6}\s*)?(?:Sources|Retrieved Sources)\s*:?\s*$",
 		answer,
 		maxsplit=1,
 	)[0].rstrip()
-	citation_numbers = {
-		int(number)
-		for citation in re.findall(r"\[(\d+(?:\s*,\s*\d+)*)\]", answer_without_sources)
-		for number in citation.split(",")
-	}
-	referenced_sources = [
-		f"{citation_number}. {citation_sources[citation_number]}"
-		for citation_number in sorted(citation_numbers)
-		if citation_number in citation_sources
+	referenced_numbers: set[int] = set()
+
+	def replace_marker(match: re.Match[str]) -> str:
+		number = int(match.group(1))
+		if number not in citation_sources:
+			return ""
+		referenced_numbers.add(number)
+		return f"(Source: {citation_sources[number]})"
+
+	rendered_answer = re.sub(
+		r"\[?\bSOURCE[_ -]?(\d+)\b\]?",
+		replace_marker,
+		answer_without_sources,
+		flags=re.IGNORECASE,
+	).strip()
+	if not referenced_numbers:
+		referenced_numbers = set(citation_sources)
+		retrieval_note = "No inline source markers were returned; showing all retrieved sources."
+	else:
+		retrieval_note = ""
+	source_lines = [
+		f"- {citation_sources[number]}"
+		for number in sorted(referenced_numbers)
+		if number in citation_sources
 	]
-	return f"{answer_without_sources}\n\nSources\n" + "\n".join(referenced_sources)
+	if retrieval_note:
+		source_lines.insert(0, retrieval_note)
+	return f"{rendered_answer}\n\nRetrieved Sources\n" + "\n".join(source_lines)
 
 
-def generate_answer(query: str, model: str) -> str:
+def escape_currency_dollars(markdown: str) -> str:
+	"""Escape dollar signs outside code so Streamlit cannot interpret LaTeX."""
+	protected: list[str] = []
+	protected_pattern = re.compile(
+		r"```[\s\S]*?```|`[^`\n]*`"
+	)
+
+	def protect(match: re.Match[str]) -> str:
+		protected.append(match.group(0))
+		return f"__PROTECTED_MARKDOWN_{len(protected) - 1}__"
+
+	text = protected_pattern.sub(protect, markdown)
+	text = re.sub(r"(?<!\\)\$", r"\\$", text)
+	for index, value in enumerate(protected):
+		text = text.replace(f"__PROTECTED_MARKDOWN_{index}__", value)
+	return text
+
+
+def generate_answer(query: str, model: str, top_k: int) -> str:
 	"""Retrieve source context and ask Gemini for a cited, grounded answer."""
-	documents = retrieve_document_context(query)
+	documents = retrieve_document_context(query, document_count=top_k)
 	if not documents:
 		return "No indexed documents are available. Upload and process a document first."
 
@@ -252,7 +358,7 @@ def generate_answer(query: str, model: str) -> str:
 
 	Provide the relevant information requested by the senior analyst clearly and accurately. Use only the document context below. If the answer is not present in the documents, say that you cannot find it in the uploaded documents. Do not invent financial figures or facts. Treat each document as an independent source: never combine a company's figures with figures from another company. Copy financial numbers, units, decimal points, commas, percent signs, and spaces exactly as written in the cited source. Do not concatenate adjacent words or values. When reporting a figure, verify that every number in the sentence comes from the same cited document.
 
-	Cite every factual statement drawn from a document using a numbered Markdown citation, such as `[1]`, immediately after the relevant sentence or figure. If a statement relies on multiple documents, use one grouped citation such as `[1, 2]`. Do not write a Sources section; the application will append the canonical numbered source list.
+	Cite every factual statement drawn from a document by placing the exact source marker `SOURCE_1`, `SOURCE_2`, and so on immediately after the relevant sentence or figure. Use multiple markers when a statement relies on multiple documents, such as `SOURCE_1 SOURCE_2`. Only use source marker numbers assigned to the documents below. Do not write a Sources section; the application will render the source references.
 
 If the documents contain confidential, private, or otherwise sensitive information relevant to the answer, clearly flag it as confidential or sensitive and remind the senior analyst to handle it carefully and avoid unauthorized disclosure.
 
@@ -266,7 +372,7 @@ USER QUESTION:
 		contents=prompt,
 	)
 	answer = response.text or "Gemini returned an empty response."
-	return append_canonical_sources(format_footnote_markers(answer), citation_sources)
+	return render_source_citations(answer, citation_sources)
 
 
 def main() -> None:
@@ -307,7 +413,7 @@ def main() -> None:
 			if initialize_chunking:
 				with st.spinner("Chunking and embedding documents..."):
 					try:
-						chunk_count = index_knowledge_base(*initialization_settings)
+						chunk_count, indexing_warnings = index_knowledge_base(*initialization_settings)
 					except Exception as error:
 						st.session_state.pop("knowledge_base_settings", None)
 						st.error("Knowledge base not available")
@@ -315,6 +421,8 @@ def main() -> None:
 					else:
 						st.session_state["knowledge_base_settings"] = initialization_settings
 						st.success(f"Knowledge base ready ({chunk_count} chunks indexed).")
+						for warning in indexing_warnings:
+							st.warning(warning)
 			knowledge_base_available = (
 				st.session_state.get("knowledge_base_settings") == initialization_settings
 			)
@@ -322,6 +430,14 @@ def main() -> None:
 				st.info("Adjust the chunk settings, then click Initialize chunking.")
 		st.divider()
 		st.subheader("Settings")
+		top_k = st.slider(
+			"Top k sources",
+			min_value=1,
+			max_value=20,
+			value=RETRIEVAL_TOP_K,
+			step=1,
+			help="Maximum number of source documents considered for each answer.",
+		)
 		model = st.selectbox("Model", ["gemini-3.5-flash"])
 
 	st.subheader("Chat")
@@ -331,7 +447,7 @@ def main() -> None:
 
 	for message in st.session_state.get("messages", []):
 		with st.chat_message(message["role"]):
-			st.markdown(message["content"])
+			st.markdown(escape_currency_dollars(message["content"]))
 
 	if knowledge_base_available and (prompt := st.chat_input("Ask a question about your documents...")):
 		st.session_state.setdefault("messages", []).append(
@@ -343,10 +459,10 @@ def main() -> None:
 		with st.chat_message("assistant"):
 			with st.spinner("Reviewing your documents..."):
 				try:
-					answer = generate_answer(prompt, model)
+					answer = generate_answer(prompt, model, top_k)
 				except Exception as error:
 					answer = f"I could not generate an answer: {error}"
-				st.markdown(answer)
+				st.markdown(escape_currency_dollars(answer))
 		st.session_state["messages"].append(
 				{"role": "assistant", "content": answer}
 			)
